@@ -3,7 +3,7 @@
 in_fn_fmt = '/Volumes/processed/{yyyymm}/{dd}/uscg_nais_{yyyymmdd_HH}.mat';
 out_fn_fmt = '~/data/sporadice/ais_proc_l1/{yyyymmdd_HHMM}.mat';
 station_fn = '~/data/sporadice/ais_station_info/station_info.mat';
-times = datenum(2022, 5, 1):1/24:datenum(2025, 5, 1)-1E-9;
+times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 12);
 far = 1E3; % How many kilometres is 'far' away
 
 %% Load

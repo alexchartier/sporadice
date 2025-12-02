@@ -1,16 +1,18 @@
 %% ais_l1_to_l2.m
-% Interpolate ERA5 duct strengths to AIS path midpoints and take
+% Sample ERA5 duct strengths along each AIS great-circle path and take
 % a three-hour rolling maximum for each report.
 
 clear
 %% Configuration
-times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 12);
+% times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 12);
+times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 9, 1, 0, 0);
 
 in_fn_fmt = '~/data/sporadice/ais_proc_l1/{yyyymmdd_HHMM}.mat';
 out_fn_fmt = '~/data/sporadice/ais_proc_l2/{yyyymmdd_HHMM}.mat';
 era5_fn_fmt = '~/data/sporadice/era5/max_duct_strength_{yyyymmdd_HHMM}.nc';
 dist_thresh_km = 100;
 reflect_alt_km = 110;
+duct_strength_threshold = -20;
 ais_freq_MHz = 162;
 station_fn = '~/data/sporadice/ais_station_info/station_info.mat';
 
@@ -35,29 +37,34 @@ for t = 1:length(times)
     ais = add_midpoint_elevation(ais, reflect_alt_km);
     ais = add_implied_nmax(ais, ais_freq_MHz);
 
-    % Calculate ERA5 duct strength
-    era_times = this_time + (-1:1) ./ 24;
-    duct_samples = nan(height(ais), numel(era_times));
+    if 0
+        % Calculate ERA5 duct strength
+        era_times = this_time + (-1:1) ./ 24;
+        % era_times = this_time;
+        duct_samples = nan(height(ais), numel(era_times));
 
-    for k = 1:numel(era_times)
-        era_fn = filename(era5_fn_fmt, era_times(k));
-        if ~isfile(era_fn)
-            fprintf('    Missing ERA5 file: %s\n', era_fn);
-            continue
+        for k = 1:numel(era_times)
+            era_fn = filename(era5_fn_fmt, era_times(k));
+            if ~isfile(era_fn)
+                fprintf('    Missing ERA5 file: %s\n', era_fn);
+                continue
+            end
+            duct_samples(:, k) = era5_max_duct_along_path(...
+                era_fn, ais.txlat, ais.txlon, ais.rxlat, ais.rxlon);
         end
-        duct_samples(:, k) = era5_duct_at_midpoints(...
-            era_fn, ais.lat_mid, ais.lon_mid);
+        ais.max_duct_strength = nanmax(duct_samples, [], 2);
+        % ais.max_duct_strength = duct_samples;
     end
 
-    ais.max_duct_strength_3hr = nanmax(duct_samples, [], 2);
+    % Calculate ERA5 duct strength within 500 km
+    ais.max_duct_strength_500km = era5_max_duct_within_500km(...
+            filename(era5_fn_fmt, this_time), ...
+            ais.txlat, ais.txlon, ais.rxlat, ais.rxlon);
 
     % Add quality flags
     ais = add_pseudo_station_id(ais, station_info);
     ais = add_station_proximity_flags(ais, station_info, dist_thresh_km);
     ais = add_quality_flags(ais);
-
-    % Classify based on flags
-    ais = classify_links(ais);
 
     % Save
     out_fn = filename(out_fn_fmt, this_time);
@@ -65,16 +72,161 @@ for t = 1:length(times)
 end
 
 
+%% Classify the links 
+for t = 1:length(times)
+    ais = loadstruct(filename(out_fn_fmt, times(t)));
 
+    % Classify based on flags
+    ais = classify_links(ais, duct_strength_threshold);
+    
+    % Save
+    out_fn = filename(out_fn_fmt, times(t));
+    save(out_fn, 'ais', '-v7');
+    fprintf('Saved to %s\n', out_fn)
+end
 
-%% Helper to interpolate a single ERA5 file to the provided midpoints
-function duct_vals = era5_duct_at_midpoints(era_fn, lat_mid, lon_mid)
+%% Helper to sample ERA5 along each link and return the pathwise maximum
+function duct_vals = era5_max_duct_along_path(era_fn, txlat, txlon, rxlat, rxlon)
+[lat_vec, lon_vec, duct_grid] = load_era5_grid(era_fn);
+
+% Build a reusable interpolant (lat, lon)
+F = griddedInterpolant({lat_vec, lon_vec}, duct_grid, 'linear', 'none');
+
+txlat = txlat(:);
+txlon = txlon(:);
+rxlat = rxlat(:);
+rxlon = rxlon(:);
+txlon(txlon > 180) = txlon(txlon > 180) - 360;
+rxlon(rxlon > 180) = rxlon(rxlon > 180) - 360;
+
+n_links = numel(txlat);
+duct_vals = nan(n_links, 1);
+dist_km = greatcircle(txlat, txlon, rxlat, rxlon);
+
+% Determine sample counts (roughly every 75 km) and allocate once
+step_km = 75;
+valid = ~(isnan(txlat) | isnan(txlon) | isnan(rxlat) | isnan(rxlon) | isnan(dist_km));
+n_samples = zeros(n_links, 1);
+n_samples(valid) = max(ceil(dist_km(valid) ./ step_km) + 1, 2);
+
+total_samples = sum(n_samples);
+if total_samples == 0
+    return
+end
+
+lat_all = nan(total_samples, 1);
+lon_all = nan(total_samples, 1);
+offsets = zeros(n_links + 1, 1);
+offsets(1) = 1;
+write_idx = 1;
+
+for i = 1:n_links
+    offsets(i) = write_idx;
+    if n_samples(i) == 0
+        continue
+    end
+    [lat_path, lon_path] = greatcircle(txlat(i), txlon(i), rxlat(i), rxlon(i), n_samples(i));
+    lon_path(lon_path > 180) = lon_path(lon_path > 180) - 360;
+    end_idx = write_idx + n_samples(i) - 1;
+    lat_all(write_idx:end_idx) = lat_path(:);
+    lon_all(write_idx:end_idx) = lon_path(:);
+    write_idx = end_idx + 1;
+end
+offsets(end) = write_idx;
+
+vals_all = F(lat_all, lon_all);
+
+for i = 1:n_links
+    if n_samples(i) == 0
+        continue
+    end
+    range = offsets(i):(offsets(i + 1) - 1);
+    duct_vals(i) = nanmax(vals_all(range));
+end
+end
+
+%% Helper to get maximum duct strength within 500 km of each link
+function duct_vals = era5_max_duct_within_500km(era_fn, txlat, txlon, rxlat, rxlon)
+[lat_vec, lon_vec, duct_grid] = load_era5_grid(era_fn);
+
+txlat = txlat(:);
+txlon = txlon(:);
+rxlat = rxlat(:);
+rxlon = rxlon(:);
+txlon(txlon > 180) = txlon(txlon > 180) - 360;
+rxlon(rxlon > 180) = rxlon(rxlon > 180) - 360;
+
+n_links = numel(txlat);
+duct_vals = nan(n_links, 1);
+dist_km = greatcircle(txlat, txlon, rxlat, rxlon);
+
+% Coarser sampling for speed; planar distance approximation
+step_km = 100;
+buffer_km = 500;
+buffer_lat_deg = buffer_km / 111; % approximate degrees latitude
+
+for i = 1:n_links
+    if isnan(txlat(i)) || isnan(txlon(i)) || isnan(rxlat(i)) || isnan(rxlon(i)) || isnan(dist_km(i))
+        continue
+    end
+
+    n_samples = max(ceil(dist_km(i) / step_km) + 1, 2);
+    [lat_path, lon_path] = greatcircle(txlat(i), txlon(i), rxlat(i), rxlon(i), n_samples);
+    lon_path = mod(lon_path + 180, 360) - 180; % wrap to [-180, 180]
+    lon_path_unw = rad2deg(unwrap(deg2rad(lon_path)));
+
+    mean_lat = mean([txlat(i), rxlat(i)], 'omitnan');
+    lon_scale = max(cosd(mean_lat), 0.2);
+    buffer_lon_deg = buffer_km / (111 * lon_scale);
+
+    lat_min = max(min(lat_path) - buffer_lat_deg, min(lat_vec));
+    lat_max = min(max(lat_path) + buffer_lat_deg, max(lat_vec));
+    lon_min = min(lon_path_unw) - buffer_lon_deg;
+    lon_max = max(lon_path_unw) + buffer_lon_deg;
+
+    lon_center = (lon_min + lon_max) / 2;
+    lon_vec_unw = lon_vec + 360 * round((lon_center - lon_vec) / 360);
+
+    lat_idx = lat_vec >= lat_min & lat_vec <= lat_max;
+    lon_idx = lon_vec_unw >= lon_min & lon_vec_unw <= lon_max;
+    if ~any(lat_idx) || ~any(lon_idx)
+        continue
+    end
+
+    sub_grid = duct_grid(lat_idx, lon_idx);
+    lat_sub = lat_vec(lat_idx);
+    lon_sub = lon_vec_unw(lon_idx);
+
+    [lon_mesh, lat_mesh] = meshgrid(lon_sub, lat_sub);
+    lat_vec_flat = lat_mesh(:);
+    lon_vec_flat = lon_mesh(:);
+
+    mean_path_lat = mean(lat_path, 'omitnan');
+    lon_scale = max(cosd(mean_path_lat), 0.2);
+
+    dlat_km = (lat_path(:) - lat_vec_flat.').*111;
+    dlon_km = (lon_path_unw(:) - lon_vec_flat.').*111*lon_scale;
+    dist2 = dlat_km.^2 + dlon_km.^2;
+
+    min_dist2 = min(dist2, [], 1);
+    close_idx = min_dist2 <= buffer_km^2;
+    if ~any(close_idx)
+        continue
+    end
+
+    candidates = sub_grid(:);
+    duct_vals(i) = max(candidates(close_idx));
+end
+end
+
+%% Helper to load and standardize an ERA5 duct grid
+function [lat_vec, lon_vec, duct_grid] = load_era5_grid(era_fn)
 lat_vec = double(ncread(era_fn, 'lat'));
 lon_vec = double(ncread(era_fn, 'lon'));
 duct_grid = double(ncread(era_fn, 'max_duct_strength'));
-duct_grid(duct_grid > 1e19) = NaN;
-% duct_grid(isnan(duct_grid)) = 0;
 
+duct_grid(duct_grid > 1e19) = -45;
+% duct_grid(isnan(duct_grid)) = -45;
 
 % NetCDF is lon x lat; transpose to lat x lon if needed
 if size(duct_grid, 1) == numel(lon_vec) && size(duct_grid, 2) == numel(lat_vec)
@@ -83,7 +235,7 @@ elseif size(duct_grid, 1) ~= numel(lat_vec) || size(duct_grid, 2) ~= numel(lon_v
     error('Unexpected ERA5 dimensions in %s', era_fn);
 end
 
-% Standardize coordinates for interpolation
+% Standardize coordinates
 if any(lon_vec > 180)
     lon_vec(lon_vec > 180) = lon_vec(lon_vec > 180) - 360;
 end
@@ -93,20 +245,6 @@ duct_grid = duct_grid(:, lon_order);
 if ~issorted(lat_vec)
     [lat_vec, lat_order] = sort(lat_vec);
     duct_grid = duct_grid(lat_order, :);
-end
-
-lon_mid = lon_mid(:);
-lon_mid(lon_mid > 180) = lon_mid(lon_mid > 180) - 360;
-lat_mid = lat_mid(:);
-
-duct_vals = interp2(lon_vec, lat_vec, duct_grid, lon_mid, lat_mid, 'linear', NaN);
-
-nan_idx = isnan(duct_vals);
-if any(nan_idx)
-    out_of_bounds = lat_mid < min(lat_vec) | lat_mid > max(lat_vec) | ...
-        lon_mid < min(lon_vec) | lon_mid > max(lon_vec);
-    nan_out = nan_idx & out_of_bounds;
-    nan_in = nan_idx & ~out_of_bounds;
 end
 end
 
@@ -295,14 +433,14 @@ end
 end
 
 %% Helper to classify links
-function ais = classify_links(ais)
+function ais = classify_links(ais, duct_strength_threshold)
 nrows = height(ais);
 var_names = ais.Properties.VariableNames;
 
 cls = repmat("other", nrows, 1);
 
 % Bad conditions override everything else
-bad_fields = {'bad_position', 'aircraft', ...
+bad_fields = {'bad_receiver', 'bad_position', 'aircraft', ...
     'likely_corrupt_lon', 'known_bad_ship', 'bogus_mmsi'};
 bad_mask = false(nrows, 1);
 for i = 1:numel(bad_fields)
@@ -313,12 +451,7 @@ end
 cls(bad_mask) = "bad";
 
 % Tropo if we have a duct strength value and not already bad
-tropo_mask = false(nrows, 1);
-if ismember('max_duct_strength', var_names)
-    tropo_mask = ~isnan(ais.max_duct_strength);
-elseif ismember('max_duct_strength_3hr', var_names)
-    tropo_mask = ~isnan(ais.max_duct_strength_3hr);
-end
+tropo_mask = ais.max_duct_strength_500km > duct_strength_threshold; 
 cls(~bad_mask & tropo_mask) = "tropo";
 
 ais.link_classification = cls;
@@ -343,33 +476,7 @@ lon0 = ais.rxlon;
 ais.elevation_midpoint_deg = elev;
 end
 
-%% Helper to load station info lat/lon
-function station_info = load_station_info(station_fn)
-station_info = [];
 
-if isempty(station_fn) || ~isfile(station_fn)
-    fprintf('    Station info file missing: %s\n', station_fn);
-    return
-end
-
-raw = load(station_fn);
-fn = fieldnames(raw);
-
-if ismember('lat', fn) && ismember('lon', fn)
-    station_info.lat = raw.lat;
-    station_info.lon = raw.lon;
-    return
-end
-
-if numel(fn) == 1 && isstruct(raw.(fn{1})) && ...
-        isfield(raw.(fn{1}), 'lat') && isfield(raw.(fn{1}), 'lon')
-    station_info.lat = raw.(fn{1}).lat;
-    station_info.lon = raw.(fn{1}).lon;
-    return
-end
-
-error('Station info in %s missing lat/lon fields.', station_fn);
-end
 
 %% Helper to pull midpoint columns with sensible fallbacks
 function ais = get_midpoints(ais)
