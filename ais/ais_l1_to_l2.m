@@ -1,18 +1,18 @@
 %% ais_l1_to_l2.m
-% Sample ERA5 duct strengths along each AIS great-circle path and take
-% a three-hour rolling maximum for each report.
+% quality flag AIS output using the link data + ERA5 duct strengths
 
 clear
 %% Configuration
-% times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 12);
-times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 9, 1, 0, 0);
+times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 12);
+% times = datenum(2024, 5, 9):1/24:datenum(2024, 5, 9, 1, 0, 0);
 
 in_fn_fmt = '~/data/sporadice/ais_proc_l1/{yyyymmdd_HHMM}.mat';
 out_fn_fmt = '~/data/sporadice/ais_proc_l2/{yyyymmdd_HHMM}.mat';
 era5_fn_fmt = '~/data/sporadice/era5/max_duct_strength_{yyyymmdd_HHMM}.nc';
-dist_thresh_km = 100;
+station_dist_thresh_km = 100;
 reflect_alt_km = 110;
-duct_strength_threshold = -20;
+duct_strength_threshold = -5;
+duct_radius_km = 100;
 ais_freq_MHz = 162;
 station_fn = '~/data/sporadice/ais_station_info/station_info.mat';
 
@@ -20,55 +20,15 @@ station_fn = '~/data/sporadice/ais_station_info/station_info.mat';
 %% Loop over times
 station_info = load_station_info(station_fn);
 
-for t = 1:length(times)
-    this_time = times(t);
-    fprintf('%s\n', datestr(this_time));
-
-    % Load AIS table
-    ais = loadstruct(filename(in_fn_fmt, this_time));
-
-    if isempty(ais)
-        warning('    AIS table is empty in %s, skipping.', in_fn);
-        continue
-    end
-
-    % Geometry to estimate electron density
-    ais = get_midpoints(ais);
-    ais = add_midpoint_elevation(ais, reflect_alt_km);
-    ais = add_implied_nmax(ais, ais_freq_MHz);
-
-    if 0
-        % Calculate ERA5 duct strength
-        era_times = this_time + (-1:1) ./ 24;
-        % era_times = this_time;
-        duct_samples = nan(height(ais), numel(era_times));
-
-        for k = 1:numel(era_times)
-            era_fn = filename(era5_fn_fmt, era_times(k));
-            if ~isfile(era_fn)
-                fprintf('    Missing ERA5 file: %s\n', era_fn);
-                continue
-            end
-            duct_samples(:, k) = era5_max_duct_along_path(...
-                era_fn, ais.txlat, ais.txlon, ais.rxlat, ais.rxlon);
-        end
-        ais.max_duct_strength = nanmax(duct_samples, [], 2);
-        % ais.max_duct_strength = duct_samples;
-    end
-
-    % Calculate ERA5 duct strength within 500 km
-    ais.max_duct_strength_500km = era5_max_duct_within_500km(...
-            filename(era5_fn_fmt, this_time), ...
-            ais.txlat, ais.txlon, ais.rxlat, ais.rxlon);
-
-    % Add quality flags
-    ais = add_pseudo_station_id(ais, station_info);
-    ais = add_station_proximity_flags(ais, station_info, dist_thresh_km);
-    ais = add_quality_flags(ais);
-
-    % Save
-    out_fn = filename(out_fn_fmt, this_time);
-    save(out_fn, 'ais', '-v7');
+% Parallelize the per-hour processing to speed up the L1 -> L2 conversion
+if isempty(gcp('nocreate'))
+    parpool; 
+end
+parfor t = 1:length(times)
+    process_single_time(...
+        times(t), in_fn_fmt, out_fn_fmt, era5_fn_fmt, ...
+        reflect_alt_km, ais_freq_MHz, duct_radius_km, ...
+        station_info, station_dist_thresh_km);
 end
 
 
@@ -85,68 +45,48 @@ for t = 1:length(times)
     fprintf('Saved to %s\n', out_fn)
 end
 
-%% Helper to sample ERA5 along each link and return the pathwise maximum
-function duct_vals = era5_max_duct_along_path(era_fn, txlat, txlon, rxlat, rxlon)
-[lat_vec, lon_vec, duct_grid] = load_era5_grid(era_fn);
 
-% Build a reusable interpolant (lat, lon)
-F = griddedInterpolant({lat_vec, lon_vec}, duct_grid, 'linear', 'none');
+%% Helper function to process one time
+function process_single_time(this_time, in_fn_fmt, out_fn_fmt, era5_fn_fmt, ...
+    reflect_alt_km, ais_freq_MHz, duct_radius_km, station_info, station_dist_thresh_km)
+fprintf('%s\n', datestr(this_time))
 
-txlat = txlat(:);
-txlon = txlon(:);
-rxlat = rxlat(:);
-rxlon = rxlon(:);
-txlon(txlon > 180) = txlon(txlon > 180) - 360;
-rxlon(rxlon > 180) = rxlon(rxlon > 180) - 360;
+% Load AIS table
+ais = loadstruct(filename(in_fn_fmt, this_time));
 
-n_links = numel(txlat);
-duct_vals = nan(n_links, 1);
-dist_km = greatcircle(txlat, txlon, rxlat, rxlon);
-
-% Determine sample counts (roughly every 75 km) and allocate once
-step_km = 75;
-valid = ~(isnan(txlat) | isnan(txlon) | isnan(rxlat) | isnan(rxlon) | isnan(dist_km));
-n_samples = zeros(n_links, 1);
-n_samples(valid) = max(ceil(dist_km(valid) ./ step_km) + 1, 2);
-
-total_samples = sum(n_samples);
-if total_samples == 0
+if isempty(ais)
+    fprintf('    AIS table is empty, skipping %s\n', datestr(this_time));
     return
 end
 
-lat_all = nan(total_samples, 1);
-lon_all = nan(total_samples, 1);
-offsets = zeros(n_links + 1, 1);
-offsets(1) = 1;
-write_idx = 1;
+% Geometry to estimate electron density
+ais = get_midpoints(ais);
+ais = add_midpoint_elevation(ais, reflect_alt_km);
+ais = add_implied_nmax(ais, ais_freq_MHz);
 
-for i = 1:n_links
-    offsets(i) = write_idx;
-    if n_samples(i) == 0
-        continue
-    end
-    [lat_path, lon_path] = greatcircle(txlat(i), txlon(i), rxlat(i), rxlon(i), n_samples(i));
-    lon_path(lon_path > 180) = lon_path(lon_path > 180) - 360;
-    end_idx = write_idx + n_samples(i) - 1;
-    lat_all(write_idx:end_idx) = lat_path(:);
-    lon_all(write_idx:end_idx) = lon_path(:);
-    write_idx = end_idx + 1;
-end
-offsets(end) = write_idx;
+% Calculate ERA5 duct strength within a configurable radius (default 500 km)
+ais.max_duct_strength = era5_max_duct_within_radius(...
+    filename(era5_fn_fmt, this_time), ...
+    ais.txlat, ais.txlon, ais.rxlat, ais.rxlon, duct_radius_km);
 
-vals_all = F(lat_all, lon_all);
+% Add quality flags
+ais = add_pseudo_station_id(ais, station_info);
+ais = add_station_proximity_flags(ais, station_info, station_dist_thresh_km);
+ais = add_quality_flags(ais);
 
-for i = 1:n_links
-    if n_samples(i) == 0
-        continue
-    end
-    range = offsets(i):(offsets(i + 1) - 1);
-    duct_vals(i) = nanmax(vals_all(range));
-end
+% Save
+out_fn = filename(out_fn_fmt, this_time);
+save(out_fn, 'ais', '-v7');
 end
 
-%% Helper to get maximum duct strength within 500 km of each link
-function duct_vals = era5_max_duct_within_500km(era_fn, txlat, txlon, rxlat, rxlon)
+%% Helper to get maximum duct strength within a chosen radius of each link
+function duct_vals = era5_max_duct_within_radius(...
+    era_fn, txlat, txlon, rxlat, rxlon, radius_km)
+
+if nargin < 6 || isempty(radius_km)
+    radius_km = 500;
+end
+radius_km = double(radius_km);
 [lat_vec, lon_vec, duct_grid] = load_era5_grid(era_fn);
 
 txlat = txlat(:);
@@ -162,7 +102,7 @@ dist_km = greatcircle(txlat, txlon, rxlat, rxlon);
 
 % Coarser sampling for speed; planar distance approximation
 step_km = 100;
-buffer_km = 500;
+buffer_km = radius_km;
 buffer_lat_deg = buffer_km / 111; % approximate degrees latitude
 
 for i = 1:n_links
@@ -451,7 +391,7 @@ end
 cls(bad_mask) = "bad";
 
 % Tropo if we have a duct strength value and not already bad
-tropo_mask = ais.max_duct_strength_500km > duct_strength_threshold; 
+tropo_mask = ais.max_duct_strength > duct_strength_threshold; 
 cls(~bad_mask & tropo_mask) = "tropo";
 
 ais.link_classification = cls;

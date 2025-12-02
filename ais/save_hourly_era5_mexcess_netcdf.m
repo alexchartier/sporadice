@@ -1,16 +1,15 @@
-close all;
-clear all;
-
 % Script to export hourly ERA5 maximum duct strength (M-excess) grids
 % into individual NetCDF files. Follows the usage pattern from
 % example_load_and_plot_era5_mexcess.m.
 
-% Spatio-temporal domain 
+%% Set inputs
 start_time = datenum([2024 5 8 0 0 0]);
 end_time = datenum([2024 5 13 0 0 0]);
 lat_box = [10 80]; % deg N
 lon_box = [-180 -50]; % deg E
 outputFolder = '~/data/sporadice/era5/';
+overwriteExistingFiles = true; % default: no-clobber, skip existing files
+
 
 latlonType = 'abs';
 modelGrid = 'era5_f320';
@@ -27,11 +26,10 @@ rootFileFolder = '/Volumes/era5';
 hourly_times = start_time:(1/24):(end_time - 1/24);
 nHours = numel(hourly_times);
 
-% Output configuration
+%%  Output configuration
 if ~exist(outputFolder, 'dir')
     mkdir(outputFolder);
 end
-overwriteExistingFiles = false; % default: no-clobber, skip existing files
 
 for idx = 1:nHours
     this_time_datenum_utc = hourly_times(idx);
@@ -69,6 +67,9 @@ for idx = 1:nHours
         % Replace non-duct points (height == 0) with NaNs before squeezing
         D.data.m_excess_ref15m_ha(D.data.ducthgt_ha == 0) = nan;
         max_duct_strength = squeeze(D.data.m_excess_ref15m_ha);
+        duct_height_km = single(D.data.ducthgt_ha);
+        duct_height_km(duct_height_km == 0) = nan;
+        duct_height_km = duct_height_km ./ single(1000); % convert meters -> kilometers
 
         % Create the NetCDF file and write coordinates + data via temp file
         nccreate(tempFilename, 'lat', 'Dimensions', {'lat', length(D.latvec)}, ...
@@ -95,6 +96,13 @@ for idx = 1:nHours
         ncwriteatt(tempFilename, 'max_duct_strength', 'units', 'dB');
         ncwriteatt(tempFilename, 'max_duct_strength', 'long_name', ...
             'Maximum duct strength (M-excess) at 15 m reference height');
+        
+        nccreate(tempFilename, 'duct_height', ...
+            'Dimensions', {'lat', length(D.latvec), 'lon', length(D.lonvec)}, ...
+            'Datatype', 'single', 'FillValue', single(1e20));
+        ncwrite(tempFilename, 'duct_height', duct_height_km);
+        ncwriteatt(tempFilename, 'duct_height', 'units', 'km');
+        ncwriteatt(tempFilename, 'duct_height', 'long_name', 'Duct height');
 
         % Global attributes for provenance
         ncwriteatt(tempFilename, '/', 'title', ...

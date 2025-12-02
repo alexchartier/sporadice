@@ -15,8 +15,10 @@ era_prev = [];
 era_next = [];
 era_prev_time = NaN;
 era_next_time = NaN;
-for t = 1%:length(times)
+for t = 1:length(times)
     this_time = times(t);
+    fprintf('%s\n', datestr(this_time))
+
     % load each hour
     clf
     if (this_time * 24) == round(this_time * 24)
